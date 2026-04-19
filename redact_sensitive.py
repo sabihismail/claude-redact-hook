@@ -16,7 +16,7 @@ import urllib.request
 GITLEAKS_URL = "https://raw.githubusercontent.com/gitleaks/gitleaks/master/config/gitleaks.toml"
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".redact_cache.json")
 CACHE_TTL = 86400  # 24 hours
-FETCH_TIMEOUT = 3  # seconds
+FETCH_TIMEOUT = 10  # seconds
 
 # ── Extra patterns not in gitleaks ────────────────────────────────────────────
 # (id, pattern, replacement)
@@ -84,13 +84,26 @@ EXTRA_PATTERNS = [
         "[CLOUDINARY_URL_REDACTED]",
     ),
     # Generic high-entropy env var values (KEY=, TOKEN=, SECRET=, API_KEY=)
-    # Catches .env file lines not caught by specific patterns above
+    # Catches .env file lines not caught by specific patterns above.
+    # (?m) makes ^ match start-of-line so the preceding newline isn't consumed.
     (
         "env-var-secret",
-        r"(?i)(?:^|\n)((?:[A-Z_]{3,50}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|AUTH))\s*=\s*)[^\s\n\"']{12,}",
+        r"(?im)^((?:[A-Z_]{3,50}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|AUTH))\s*=\s*)[^\s\n\"']{12,}",
         r"\1[REDACTED]",
     ),
 ]
+
+def _compile_extra():
+    result = []
+    for rule_id, pat, repl in EXTRA_PATTERNS:
+        try:
+            result.append((rule_id, re.compile(pat), repl))
+        except re.error as exc:
+            print(f"[redact-hook] EXTRA_PATTERNS '{rule_id}' failed to compile: {exc}", file=sys.stderr)
+    return result
+
+_EXTRA_COMPILED = _compile_extra()
+_FLAG_RE = re.compile(r"\(\?([a-z]+)\)")
 
 # ── TOML fetch & parse ────────────────────────────────────────────────────────
 
@@ -111,7 +124,7 @@ def parse_toml(toml_text):
     cause the parser to steal the next rule's regex).
     """
     results = []
-    id_pat = re.compile(r'id\s*=\s*["\']([^"\']+)["\']')
+    id_pat = re.compile(r'(?m)^id\s*=\s*["\']([^"\']+)["\']')
     regex_pat = re.compile(r"regex\s*=\s*(?:'''(.*?)'''|\"([^\"]+)\")", re.DOTALL)
 
     for block in re.split(r"\[\[rules\]\]", toml_text):
@@ -129,43 +142,82 @@ def parse_toml(toml_text):
 # ── Go RE2 → Python re conversion ────────────────────────────────────────────
 
 _POSIX = [
-    ("[[:alnum:]]",  "[a-zA-Z0-9]"),
-    ("[[:alpha:]]",  "[a-zA-Z]"),
-    ("[[:digit:]]",  "[0-9]"),
-    ("[[:word:]]",   r"\w"),
-    ("[[:space:]]",  r"\s"),
-    ("[[:upper:]]",  "[A-Z]"),
-    ("[[:lower:]]",  "[a-z]"),
-    ("[[:xdigit:]]", "[0-9a-fA-F]"),
-    ("[[:print:]]",  r"[\x20-\x7e]"),
-    ("[[:ascii:]]",  r"[\x00-\x7f]"),
-    ("[[:blank:]]",  r"[ \t]"),
-    ("[[:cntrl:]]",  r"[\x00-\x1f\x7f]"),
-    ("[[:graph:]]",  r"[\x21-\x7e]"),
-    ("[[:punct:]]",  r"[^\w\s]"),
+    # Keys use the inner [:class:] form (no outer brackets) so that replacements
+    # work both standalone ([[:alnum:]] → [a-zA-Z0-9]) and inside combined
+    # character classes ([[:alnum:]_-] → [a-zA-Z0-9_-]).
+    ("[:alnum:]",  "a-zA-Z0-9"),
+    ("[:alpha:]",  "a-zA-Z"),
+    ("[:digit:]",  "0-9"),
+    ("[:word:]",   r"\w"),
+    ("[:space:]",  r"\s"),
+    ("[:upper:]",  "A-Z"),
+    ("[:lower:]",  "a-z"),
+    ("[:xdigit:]", "0-9a-fA-F"),
+    ("[:print:]",  r"\x20-\x7e"),
+    ("[:ascii:]",  r"\x00-\x7f"),
+    ("[:blank:]",  r" \t"),
+    ("[:cntrl:]",  r"\x00-\x1f\x7f"),
+    ("[:graph:]",  r"\x21-\x7e"),
+    ("[:punct:]",  r"^\w\s"),
 ]
 
 
 def go_to_python(raw):
     for posix, py in _POSIX:
         raw = raw.replace(posix, py)
+    # Unicode property escapes (\p{L}, \P{N}, etc.) — not supported by Python re.
+    # Approximated to ASCII ranges; FP risk accepted (redaction tool: FP << FN).
+    # When the property appears inside an existing [...] class, expand to content only
+    # (no extra brackets); otherwise wrap in [...] so it works as a standalone token.
+    def _expand_prop(inside, outside):
+        """Return a re.sub replacement function that wraps or not based on context."""
+        def _sub(m):
+            # A preceding '[' that hasn't been closed means we're inside a char class.
+            preceding = raw[: m.start()]
+            in_class = preceding.count("[") > preceding.count("]")
+            return inside if in_class else outside
+        return _sub
+
+    raw = re.sub(r"\\p\{Lu\}",    _expand_prop("A-Z",       "[A-Z]"),       raw)
+    raw = re.sub(r"\\p\{Ll\}",    _expand_prop("a-z",       "[a-z]"),       raw)
+    raw = re.sub(r"\\p\{L\}",     _expand_prop("a-zA-Z",    "[a-zA-Z]"),    raw)
+    raw = re.sub(r"\\p\{N[d]?\}", _expand_prop("0-9",       "[0-9]"),       raw)
+    raw = re.sub(r"\\p\{Xwd\}",   _expand_prop(r"\w",       r"\w"),         raw)
+    raw = re.sub(r"\\P\{Lu\}",    _expand_prop("^A-Z",      "[^A-Z]"),      raw)
+    raw = re.sub(r"\\P\{Ll\}",    _expand_prop("^a-z",      "[^a-z]"),      raw)
+    raw = re.sub(r"\\P\{L\}",     _expand_prop("^a-zA-Z",   "[^a-zA-Z]"),   raw)
+    raw = re.sub(r"\\P\{N[d]?\}", _expand_prop("^0-9",      "[^0-9]"),      raw)
+    raw = re.sub(r"\\p\{[^}]+\}", _expand_prop(r"\w",       r"\w"),         raw)
+    raw = re.sub(r"\\P\{[^}]+\}", _expand_prop(r"\W",       r"\W"),         raw)
+    # \z — RE2 absolute end-of-string anchor; Python uses \Z
+    raw = raw.replace(r"\z", r"\Z")
     # (?-i:...) — inline flag-off unsupported in Python re; degrade to (?:...)
     # Slight false-positive risk accepted (redaction tool, FP << FN)
-    raw = re.sub(r"\(\?-i:", "(?:", raw)
-    # (?i) mid-pattern — Python 3.11+ rejects global flags not at position 0;
-    # move to front so the whole pattern becomes case-insensitive.
-    if "(?i)" in raw and not raw.startswith("(?i)"):
-        raw = "(?i)" + raw.replace("(?i)", "")
+    raw = re.sub(r"\(\?-[a-z]+:", "(?:", raw)
+    # Inline flags mid-pattern — Python 3.11+ rejects them anywhere except position 0.
+    # Collect all (?flags) occurrences, strip them from body, prepend merged flag group.
+    flags_found = _FLAG_RE.findall(raw)
+    if flags_found:
+        body = _FLAG_RE.sub("", raw)
+        merged = "".join(dict.fromkeys("".join(flags_found)))  # deduplicated, ordered
+        raw = f"(?{merged})" + body
     return raw
 
 
 def compile_patterns(raw_patterns):
     compiled = []
+    failed = []
     for rule_id, raw in raw_patterns:
         try:
             compiled.append((rule_id, re.compile(go_to_python(raw))))
-        except re.error:
-            pass
+        except re.error as exc:
+            failed.append(f"{rule_id} ({exc})")
+    if failed:
+        print(
+            f"[redact-hook] {len(failed)} pattern(s) skipped (compile error): "
+            + ", ".join(failed),
+            file=sys.stderr,
+        )
     return compiled
 
 
@@ -217,7 +269,7 @@ def redact(text, compiled):
         label = make_label(rule_id)
         if regex.groups >= 1:
             def replacer(m, lbl=label):
-                if m.lastindex and m.lastindex >= 1:
+                if m.lastindex:
                     s, e = m.span(1)
                     fs = m.start(0)
                     full = m.group(0)
@@ -227,8 +279,8 @@ def redact(text, compiled):
         else:
             text = regex.sub(label, text)
 
-    for _, pattern, replacement in EXTRA_PATTERNS:
-        text = re.sub(pattern, replacement, text)
+    for _, regex, replacement in _EXTRA_COMPILED:
+        text = regex.sub(replacement, text)
 
     return text
 
@@ -236,7 +288,10 @@ def redact(text, compiled):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return  # malformed input — pass through unchanged
     prompt = data.get("prompt", "")
     compiled = compile_patterns(get_raw_patterns())
     redacted = redact(prompt, compiled)

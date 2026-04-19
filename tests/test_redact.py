@@ -386,6 +386,22 @@ class TestEdgeCases(unittest.TestCase):
             rs.main()
         self.assertEqual(captured.getvalue().strip(), "")
 
+    def test_malformed_json_does_not_crash(self):
+        # Non-JSON stdin must be silently ignored (fail-open)
+        captured = io.StringIO()
+        with patch("sys.stdin", io.StringIO("not json {")), patch("sys.stdout", captured):
+            rs.main()  # must not raise
+        self.assertEqual(captured.getvalue().strip(), "")
+
+    def test_env_var_newline_preserved(self):
+        # Redacting an env var must not eat the preceding newline
+        prompt = "host=db.example.com\nMY_API_KEY=supersecretvalue1234567890"
+        result = run_hook(prompt)
+        self.assertIsNotNone(result)
+        self.assertIn("\n", result["prompt"], "newline between lines must be preserved")
+        self.assertIn("host=db.example.com", result["prompt"])
+        self.assertNotIn("supersecretvalue1234567890", result["prompt"])
+
 
 # ── TOML parser ───────────────────────────────────────────────────────────────
 
@@ -459,6 +475,17 @@ regex = '''(?i)[\\w.-]{0,50}?[\\s'"]{0,3}([a-z0-9]{32})(?:[\\x60'"\\s;]|$)'''
         results = rs.parse_toml(toml)
         self.assertEqual(len(results), 10)
 
+    def test_id_inside_regex_not_confused_with_rule_id(self):
+        """A regex that contains 'id = ...' text must not corrupt the parsed rule id."""
+        toml = """
+[[rules]]
+id = "real-rule"
+regex = '''(?i)(?:client_id = "[a-z]+"|token-[a-z]{8})'''
+"""
+        results = rs.parse_toml(toml)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], "real-rule")
+
 
 # ── Go regex converter ────────────────────────────────────────────────────────
 
@@ -496,6 +523,129 @@ class TestGoToPython(unittest.TestCase):
             re.compile(converted)
         except re.error as e:
             self.fail(f"Converted pattern failed to compile: {e}")
+
+    # ── POSIX classes in combined character classes ───────────────────────────
+
+    def test_posix_combined_alnum_with_extra_chars(self):
+        # [[:alnum:]_-] must become [a-zA-Z0-9_-], not [a-zA-Z0-9]_-]
+        converted = rs.go_to_python("[[:alnum:]_-]")
+        self.assertEqual(converted, "[a-zA-Z0-9_-]")
+        re.compile(converted)
+
+    def test_posix_combined_two_classes(self):
+        converted = rs.go_to_python("[[:alpha:][:digit:]]")
+        self.assertNotIn("[[", converted)
+        re.compile(converted)
+        self.assertIsNotNone(re.match(converted, "a"))
+        self.assertIsNotNone(re.match(converted, "5"))
+
+    def test_posix_word_inside_combined(self):
+        converted = rs.go_to_python(r"[[:word:]\-]+")
+        re.compile(converted)  # must not raise
+
+    # ── Flag hoisting doesn't touch named groups ──────────────────────────────
+
+    def test_named_group_not_stripped_by_flag_hoist(self):
+        raw = r"(?i)(?P<token>[a-z]{32})"
+        converted = rs.go_to_python(raw)
+        self.assertIn("(?P<token>", converted)
+        m = re.match(converted, "abcdefghijklmnopqrstuvwxyzabcdef")
+        self.assertIsNotNone(m)
+        self.assertIsNotNone(m.group("token"))
+
+    def test_backreference_not_stripped(self):
+        raw = r"(?i)(?P<q>['\"]).*?(?P=q)"
+        converted = rs.go_to_python(raw)
+        self.assertIn("(?P=q)", converted)
+        re.compile(converted)
+
+    # ── Unicode property escapes ──────────────────────────────────────────────
+
+    def test_unicode_prop_L_converted(self):
+        result = rs.go_to_python(r"\p{L}+")
+        self.assertNotIn(r"\p{", result)
+        re.compile(result)
+
+    def test_unicode_prop_Lu_converted(self):
+        result = rs.go_to_python(r"\p{Lu}+")
+        self.assertEqual(result, "[A-Z]+")
+
+    def test_unicode_prop_Ll_converted(self):
+        result = rs.go_to_python(r"\p{Ll}+")
+        self.assertEqual(result, "[a-z]+")
+
+    def test_unicode_prop_N_converted(self):
+        result = rs.go_to_python(r"\p{N}+")
+        self.assertEqual(result, "[0-9]+")
+
+    def test_unicode_prop_Nd_converted(self):
+        result = rs.go_to_python(r"\p{Nd}+")
+        self.assertEqual(result, "[0-9]+")
+
+    def test_unicode_prop_Xwd_converted(self):
+        result = rs.go_to_python(r"\p{Xwd}+")
+        self.assertIn(r"\w", result)
+        re.compile(result)
+
+    def test_unicode_prop_negated_L_converted(self):
+        result = rs.go_to_python(r"\P{L}+")
+        self.assertNotIn(r"\P{", result)
+        re.compile(result)
+
+    def test_unicode_prop_catchall_unknown_converted(self):
+        result = rs.go_to_python(r"\p{Sc}+")
+        self.assertNotIn(r"\p{", result)
+        re.compile(result)
+
+    def test_unicode_prop_combined_pattern_compiles(self):
+        raw = r"(?i)\p{L}[\p{L}\p{N}_]{2,30}"
+        converted = rs.go_to_python(raw)
+        self.assertNotIn(r"\p{", converted)
+        re.compile(converted)
+
+    def test_unicode_prop_inside_char_class_no_double_bracket(self):
+        # [\p{L}] must not become [[a-zA-Z]] (double bracket breaks char class)
+        converted = rs.go_to_python(r"[\p{L}]")
+        self.assertNotIn("[[", converted, f"Double bracket in: {converted!r}")
+        re.compile(converted)
+
+    def test_unicode_prop_combined_with_literal_in_class(self):
+        # [\p{L}_-] must compile and not close the class prematurely
+        converted = rs.go_to_python(r"[\p{L}_\-]+")
+        self.assertNotIn("[[", converted)
+        compiled = re.compile(converted)
+        self.assertIsNotNone(compiled.match("hello_world"))
+
+
+# ── compile_patterns error visibility ────────────────────────────────────────
+
+class TestCompilePatterns(unittest.TestCase):
+
+    def test_valid_patterns_compiled(self):
+        compiled = rs.compile_patterns([("good-rule", r"token-[a-z]{8}")])
+        self.assertEqual(len(compiled), 1)
+        self.assertEqual(compiled[0][0], "good-rule")
+
+    def test_invalid_pattern_logged_to_stderr(self):
+        import io as _io
+        stderr_capture = _io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            compiled = rs.compile_patterns([("bad-rule", r"[invalid")])
+        self.assertEqual(len(compiled), 0)
+        err = stderr_capture.getvalue()
+        self.assertIn("bad-rule", err)
+        self.assertIn("redact-hook", err)
+
+    def test_mixed_valid_invalid_only_valid_compiled(self):
+        import io as _io
+        stderr_capture = _io.StringIO()
+        patterns = [("good", r"token-[a-z]{8}"), ("bad", r"[invalid"), ("also-good", r"\d{4}")]
+        with patch("sys.stderr", stderr_capture):
+            compiled = rs.compile_patterns(patterns)
+        self.assertEqual(len(compiled), 2)
+        self.assertEqual(compiled[0][0], "good")
+        self.assertEqual(compiled[1][0], "also-good")
+        self.assertIn("bad", stderr_capture.getvalue())
 
 
 # ── Cache behaviour ───────────────────────────────────────────────────────────
