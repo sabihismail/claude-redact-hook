@@ -120,7 +120,13 @@ Open `/hooks` in Claude Code or restart it. The hook is now active.
 python -m unittest tests/test_redact.py -v
 ```
 
-Tests cover: EXTRA_PATTERNS (PEM keys, connection strings, credit cards, bearer headers), 20+ sampled gitleaks patterns, TOML parser correctness (including the path-only rule edge case), cache TTL/fallback behaviour, and hook I/O contract.
+83 tests covering:
+- **EXTRA_PATTERNS** — PEM keys (RSA/EC/DSA/OpenSSH/PGP), connection strings, auth headers, credit cards, env var secrets
+- **Gitleaks patterns** — 30+ sampled across AI/cloud/payments/messaging/infra categories, split into standalone (prefix-anchored, specific label verified) and keyword-context (secret gone regardless of label) variants
+- **TOML parser** — path-only rules excluded, plaid-api-token cross-rule contamination bug, triple-quoted regexes with embedded quotes
+- **Go → Python regex conversion** — POSIX classes, `(?-i:...)` removal, mid-pattern `(?i)` hoisting
+- **Cache** — fresh hit (no network call), stale + successful fetch (new patterns returned), stale + network failure (fallback), no cache + no network (empty)
+- **Hook I/O contract** — stdin JSON → stdout JSON or no output, surrounding text preserved, double-redaction prevention
 
 ---
 
